@@ -1,0 +1,400 @@
+-- SQLite schema for the Pet Health Tracker Android app.
+--
+-- Direct port of the desktop app's core/db.py SCHEMA_SQL/TRIGGER_SQL — same
+-- table names, columns, constraints, and cross-pet-match triggers, so the
+-- two apps' database files stay structurally compatible even though this is
+-- a from-scratch Dart rewrite, not shared code (Option B: native rewrite,
+-- schema-as-spec only — see the Android repo's MODULE_PROGRESS.md).
+--
+-- Not ported: the desktop app's own `schema_version` table — drift tracks
+-- schema version itself via AppDatabase.schemaVersion + PRAGMA user_version,
+-- so a second, app-level version counter would be redundant here.
+--
+-- Table order matters: a table can only reference tables already created above it.
+
+CREATE TABLE pets (
+    id TEXT NOT NULL PRIMARY KEY,
+    name TEXT NOT NULL,
+    species TEXT NOT NULL,
+    breed TEXT NULL,
+    sex TEXT NULL,
+    date_of_birth TEXT NULL,
+    approximate_age_value INTEGER NULL,
+    approximate_age_set_at TEXT NULL,
+    color_markings TEXT NULL,
+    sterilization_status TEXT NULL,
+    life_status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    last_edited_at TEXT NOT NULL,
+    CHECK (date_of_birth IS NULL OR approximate_age_value IS NULL),
+    CHECK (life_status IN ('active', 'deceased', 'rehomed'))
+);
+
+CREATE TABLE people (
+    id TEXT NOT NULL PRIMARY KEY,
+    name TEXT NOT NULL,
+    relationship_label TEXT NULL,
+    contact_info TEXT NULL,
+    is_archived BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TEXT NOT NULL,
+    last_edited_at TEXT NOT NULL
+);
+
+CREATE TABLE vet_appointments (
+    id TEXT NOT NULL PRIMARY KEY,
+    pet_id TEXT NOT NULL REFERENCES pets(id),
+    date TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    clinic_name TEXT NULL,
+    outcome_notes TEXT NULL,
+    status TEXT NOT NULL DEFAULT 'scheduled',
+    handled_by_person_id TEXT NULL REFERENCES people(id),
+    created_at TEXT NOT NULL,
+    last_edited_at TEXT NOT NULL,
+    CHECK (status IN ('scheduled', 'completed', 'cancelled'))
+);
+
+CREATE TABLE hospitalizations (
+    id TEXT NOT NULL PRIMARY KEY,
+    pet_id TEXT NOT NULL REFERENCES pets(id),
+    admission_date TEXT NOT NULL,
+    discharge_date TEXT NULL,
+    reason TEXT NOT NULL,
+    provider TEXT NULL,
+    outcome_notes TEXT NULL,
+    handled_by_person_id TEXT NULL REFERENCES people(id),
+    created_at TEXT NOT NULL,
+    last_edited_at TEXT NOT NULL,
+    CHECK (discharge_date IS NULL OR discharge_date >= admission_date)
+);
+
+CREATE TABLE procedures_surgeries (
+    id TEXT NOT NULL PRIMARY KEY,
+    pet_id TEXT NOT NULL REFERENCES pets(id),
+    procedure_name TEXT NOT NULL,
+    date TEXT NOT NULL,
+    provider TEXT NULL,
+    outcome_notes TEXT NULL,
+    anesthesia_info TEXT NULL,
+    related_hospitalization_id TEXT NULL REFERENCES hospitalizations(id),
+    handled_by_person_id TEXT NULL REFERENCES people(id),
+    created_at TEXT NOT NULL,
+    last_edited_at TEXT NOT NULL
+);
+
+CREATE TABLE illness_custom_events (
+    id TEXT NOT NULL PRIMARY KEY,
+    pet_id TEXT NOT NULL REFERENCES pets(id),
+    title TEXT NOT NULL,
+    date TEXT NOT NULL,
+    description TEXT NULL,
+    provider TEXT NULL,
+    status TEXT NULL,
+    related_appointment_id TEXT NULL REFERENCES vet_appointments(id),
+    handled_by_person_id TEXT NULL REFERENCES people(id),
+    created_at TEXT NOT NULL,
+    last_edited_at TEXT NOT NULL
+);
+
+CREATE TABLE vaccinations (
+    id TEXT NOT NULL PRIMARY KEY,
+    pet_id TEXT NOT NULL REFERENCES pets(id),
+    vaccine_name TEXT NOT NULL,
+    date_administered TEXT NOT NULL,
+    provider TEXT NULL,
+    lot_number TEXT NULL,
+    next_due_date TEXT NULL,
+    notes TEXT NULL,
+    handled_by_person_id TEXT NULL REFERENCES people(id),
+    created_at TEXT NOT NULL,
+    last_edited_at TEXT NOT NULL,
+    CHECK (next_due_date IS NULL OR next_due_date >= date_administered)
+);
+
+CREATE TABLE microchip_records (
+    id TEXT NOT NULL PRIMARY KEY,
+    pet_id TEXT NOT NULL REFERENCES pets(id),
+    chip_number TEXT NOT NULL,
+    registry_provider TEXT NULL,
+    date_implanted TEXT NULL,
+    notes TEXT NULL,
+    created_at TEXT NOT NULL,
+    last_edited_at TEXT NOT NULL
+);
+
+CREATE TABLE medications (
+    id TEXT NOT NULL PRIMARY KEY,
+    pet_id TEXT NOT NULL REFERENCES pets(id),
+    name TEXT NOT NULL,
+    strength TEXT NULL,
+    medication_type TEXT NOT NULL,
+    start_date TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    notes TEXT NULL,
+    handled_by_person_id TEXT NULL REFERENCES people(id),
+    created_at TEXT NOT NULL,
+    last_edited_at TEXT NOT NULL,
+    CHECK (medication_type IN ('pill', 'syrup', 'injection', 'cream_lotion')),
+    CHECK (status IN ('active', 'completed', 'stopped'))
+);
+
+-- A medication has one or more phases, run in phase_order sequence — a
+-- single flat course is just one phase; titration (e.g. "2 pills for 3
+-- days, then 1 pill for 7 days") is multiple. dose_times is a plain
+-- comma-separated "HH:MM" list (e.g. "08:00,20:00") rather than a JSON
+-- column — matches this schema's existing convention of plain TEXT over
+-- structured columns, and its length always matches times_per_day.
+CREATE TABLE medication_phases (
+    id TEXT NOT NULL PRIMARY KEY,
+    medication_id TEXT NOT NULL REFERENCES medications(id),
+    phase_order INTEGER NOT NULL,
+    dose_amount TEXT NOT NULL,
+    times_per_day INTEGER NOT NULL,
+    dose_times TEXT NULL,
+    duration_type TEXT NOT NULL,
+    duration_days INTEGER NULL,
+    duration_dose_count INTEGER NULL,
+    CHECK (duration_type IN ('time_based', 'dose_based')),
+    CHECK (times_per_day >= 1),
+    CHECK (
+        (duration_type = 'time_based' AND duration_days IS NOT NULL AND duration_dose_count IS NULL)
+        OR
+        (duration_type = 'dose_based' AND duration_dose_count IS NOT NULL AND duration_days IS NULL)
+    )
+);
+
+-- The dose compliance log — one row per dose actually marked given.
+-- scheduled_for is what the schedule said was due; given_at is when it was
+-- actually logged, so the two can drift apart without losing the record.
+-- Whether a phase/medication is complete is computed from this log, not
+-- stored, same "compute at query time" pattern reminders.status uses for
+-- urgency.
+CREATE TABLE medication_doses (
+    id TEXT NOT NULL PRIMARY KEY,
+    medication_id TEXT NOT NULL REFERENCES medications(id),
+    phase_id TEXT NOT NULL REFERENCES medication_phases(id),
+    scheduled_for TEXT NOT NULL,
+    given_at TEXT NOT NULL
+);
+
+CREATE TABLE reminders (
+    id TEXT NOT NULL PRIMARY KEY,
+    pet_id TEXT NOT NULL REFERENCES pets(id),
+    title TEXT NOT NULL,
+    due_date TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    snoozed_until TEXT NULL,
+    source_record_type TEXT NULL,
+    source_record_id TEXT NULL,
+    is_manually_overridden BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TEXT NOT NULL,
+    last_edited_at TEXT NOT NULL,
+    CHECK ((source_record_type IS NULL) = (source_record_id IS NULL)),
+    CHECK (status IN ('active', 'snoozed', 'done', 'dismissed'))
+);
+
+CREATE TABLE attachments (
+    id TEXT NOT NULL PRIMARY KEY,
+    pet_id TEXT NOT NULL REFERENCES pets(id),
+    linked_record_type TEXT NULL,
+    linked_record_id TEXT NULL,
+    file_name TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    file_type TEXT NOT NULL,
+    description TEXT NULL,
+    uploaded_at TEXT NOT NULL,
+    CHECK ((linked_record_type IS NULL) = (linked_record_id IS NULL))
+);
+
+CREATE TABLE notes (
+    id TEXT NOT NULL PRIMARY KEY,
+    pet_id TEXT NOT NULL REFERENCES pets(id),
+    date TEXT NOT NULL,
+    -- Column stays named "text" in SQL (matches core/db.py's schema exactly),
+    -- but drift's Table base class has its own inherited text() builder
+    -- method, so the generated Dart getter for this column needs renaming
+    -- via "AS" — caught live: codegen failed with "Can't declare a member
+    -- that conflicts with an inherited one" before this was added.
+    text TEXT NOT NULL AS noteText,
+    linked_record_type TEXT NULL,
+    linked_record_id TEXT NULL,
+    handled_by_person_id TEXT NULL REFERENCES people(id),
+    created_at TEXT NOT NULL,
+    last_edited_at TEXT NOT NULL,
+    CHECK ((linked_record_type IS NULL) = (linked_record_id IS NULL))
+);
+
+CREATE TABLE app_settings (
+    id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+    theme TEXT NOT NULL DEFAULT 'dark',
+    last_edited_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_vet_appointments_pet ON vet_appointments(pet_id);
+CREATE INDEX idx_hospitalizations_pet ON hospitalizations(pet_id);
+CREATE INDEX idx_procedures_pet ON procedures_surgeries(pet_id);
+CREATE INDEX idx_illness_events_pet ON illness_custom_events(pet_id);
+CREATE INDEX idx_vaccinations_pet ON vaccinations(pet_id);
+CREATE INDEX idx_microchip_pet ON microchip_records(pet_id);
+CREATE INDEX idx_medications_pet ON medications(pet_id);
+CREATE INDEX idx_medication_phases_medication ON medication_phases(medication_id);
+CREATE INDEX idx_medication_doses_medication ON medication_doses(medication_id);
+CREATE INDEX idx_reminders_pet ON reminders(pet_id);
+CREATE INDEX idx_reminders_status_due ON reminders(status, due_date);
+CREATE INDEX idx_attachments_pet ON attachments(pet_id);
+CREATE INDEX idx_notes_pet ON notes(pet_id);
+
+-- Cross-pet-match triggers: a polymorphic link's referenced record must
+-- belong to the same pet as the row holding the link. Plain foreign keys
+-- can't express this because the target table varies by type — same
+-- limitation and same fix as core/db.py's _pet_match_trigger_sql().
+
+CREATE TRIGGER reminders_pet_match_insert BEFORE INSERT ON reminders
+WHEN NEW.source_record_type IS NOT NULL
+BEGIN
+    SELECT CASE
+        WHEN NEW.source_record_type = 'vet_appointment' AND NOT EXISTS (
+            SELECT 1 FROM vet_appointments WHERE id = NEW.source_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'reminders.source_record_type record does not belong to the selected pet')
+        WHEN NEW.source_record_type = 'vaccination' AND NOT EXISTS (
+            SELECT 1 FROM vaccinations WHERE id = NEW.source_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'reminders.source_record_type record does not belong to the selected pet')
+        WHEN NEW.source_record_type = 'procedure' AND NOT EXISTS (
+            SELECT 1 FROM procedures_surgeries WHERE id = NEW.source_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'reminders.source_record_type record does not belong to the selected pet')
+        WHEN NEW.source_record_type = 'hospitalization' AND NOT EXISTS (
+            SELECT 1 FROM hospitalizations WHERE id = NEW.source_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'reminders.source_record_type record does not belong to the selected pet')
+        WHEN NEW.source_record_type = 'illness_custom_event' AND NOT EXISTS (
+            SELECT 1 FROM illness_custom_events WHERE id = NEW.source_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'reminders.source_record_type record does not belong to the selected pet')
+        WHEN NEW.source_record_type = 'medication' AND NOT EXISTS (
+            SELECT 1 FROM medications WHERE id = NEW.source_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'reminders.source_record_type record does not belong to the selected pet')
+    END;
+END;
+
+CREATE TRIGGER reminders_pet_match_update BEFORE UPDATE ON reminders
+WHEN NEW.source_record_type IS NOT NULL
+BEGIN
+    SELECT CASE
+        WHEN NEW.source_record_type = 'vet_appointment' AND NOT EXISTS (
+            SELECT 1 FROM vet_appointments WHERE id = NEW.source_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'reminders.source_record_type record does not belong to the selected pet')
+        WHEN NEW.source_record_type = 'vaccination' AND NOT EXISTS (
+            SELECT 1 FROM vaccinations WHERE id = NEW.source_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'reminders.source_record_type record does not belong to the selected pet')
+        WHEN NEW.source_record_type = 'procedure' AND NOT EXISTS (
+            SELECT 1 FROM procedures_surgeries WHERE id = NEW.source_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'reminders.source_record_type record does not belong to the selected pet')
+        WHEN NEW.source_record_type = 'hospitalization' AND NOT EXISTS (
+            SELECT 1 FROM hospitalizations WHERE id = NEW.source_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'reminders.source_record_type record does not belong to the selected pet')
+        WHEN NEW.source_record_type = 'illness_custom_event' AND NOT EXISTS (
+            SELECT 1 FROM illness_custom_events WHERE id = NEW.source_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'reminders.source_record_type record does not belong to the selected pet')
+        WHEN NEW.source_record_type = 'medication' AND NOT EXISTS (
+            SELECT 1 FROM medications WHERE id = NEW.source_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'reminders.source_record_type record does not belong to the selected pet')
+    END;
+END;
+
+CREATE TRIGGER attachments_pet_match_insert BEFORE INSERT ON attachments
+WHEN NEW.linked_record_type IS NOT NULL
+BEGIN
+    SELECT CASE
+        WHEN NEW.linked_record_type = 'vet_appointment' AND NOT EXISTS (
+            SELECT 1 FROM vet_appointments WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'attachments.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'vaccination' AND NOT EXISTS (
+            SELECT 1 FROM vaccinations WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'attachments.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'procedure' AND NOT EXISTS (
+            SELECT 1 FROM procedures_surgeries WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'attachments.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'hospitalization' AND NOT EXISTS (
+            SELECT 1 FROM hospitalizations WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'attachments.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'illness_custom_event' AND NOT EXISTS (
+            SELECT 1 FROM illness_custom_events WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'attachments.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'microchip_record' AND NOT EXISTS (
+            SELECT 1 FROM microchip_records WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'attachments.linked_record_type record does not belong to the selected pet')
+    END;
+END;
+
+CREATE TRIGGER attachments_pet_match_update BEFORE UPDATE ON attachments
+WHEN NEW.linked_record_type IS NOT NULL
+BEGIN
+    SELECT CASE
+        WHEN NEW.linked_record_type = 'vet_appointment' AND NOT EXISTS (
+            SELECT 1 FROM vet_appointments WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'attachments.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'vaccination' AND NOT EXISTS (
+            SELECT 1 FROM vaccinations WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'attachments.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'procedure' AND NOT EXISTS (
+            SELECT 1 FROM procedures_surgeries WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'attachments.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'hospitalization' AND NOT EXISTS (
+            SELECT 1 FROM hospitalizations WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'attachments.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'illness_custom_event' AND NOT EXISTS (
+            SELECT 1 FROM illness_custom_events WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'attachments.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'microchip_record' AND NOT EXISTS (
+            SELECT 1 FROM microchip_records WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'attachments.linked_record_type record does not belong to the selected pet')
+    END;
+END;
+
+CREATE TRIGGER notes_pet_match_insert BEFORE INSERT ON notes
+WHEN NEW.linked_record_type IS NOT NULL
+BEGIN
+    SELECT CASE
+        WHEN NEW.linked_record_type = 'vet_appointment' AND NOT EXISTS (
+            SELECT 1 FROM vet_appointments WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'notes.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'vaccination' AND NOT EXISTS (
+            SELECT 1 FROM vaccinations WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'notes.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'procedure' AND NOT EXISTS (
+            SELECT 1 FROM procedures_surgeries WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'notes.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'hospitalization' AND NOT EXISTS (
+            SELECT 1 FROM hospitalizations WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'notes.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'illness_custom_event' AND NOT EXISTS (
+            SELECT 1 FROM illness_custom_events WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'notes.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'microchip_record' AND NOT EXISTS (
+            SELECT 1 FROM microchip_records WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'notes.linked_record_type record does not belong to the selected pet')
+    END;
+END;
+
+CREATE TRIGGER notes_pet_match_update BEFORE UPDATE ON notes
+WHEN NEW.linked_record_type IS NOT NULL
+BEGIN
+    SELECT CASE
+        WHEN NEW.linked_record_type = 'vet_appointment' AND NOT EXISTS (
+            SELECT 1 FROM vet_appointments WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'notes.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'vaccination' AND NOT EXISTS (
+            SELECT 1 FROM vaccinations WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'notes.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'procedure' AND NOT EXISTS (
+            SELECT 1 FROM procedures_surgeries WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'notes.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'hospitalization' AND NOT EXISTS (
+            SELECT 1 FROM hospitalizations WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'notes.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'illness_custom_event' AND NOT EXISTS (
+            SELECT 1 FROM illness_custom_events WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'notes.linked_record_type record does not belong to the selected pet')
+        WHEN NEW.linked_record_type = 'microchip_record' AND NOT EXISTS (
+            SELECT 1 FROM microchip_records WHERE id = NEW.linked_record_id AND pet_id = NEW.pet_id
+        ) THEN RAISE(ABORT, 'notes.linked_record_type record does not belong to the selected pet')
+    END;
+END;
