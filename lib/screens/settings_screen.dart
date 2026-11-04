@@ -9,6 +9,7 @@ import '../data/database.dart';
 import '../providers/database_providers.dart';
 import '../providers/theme_provider.dart';
 import '../theme/app_theme.dart';
+import 'privacy_policy_screen.dart';
 
 final _peopleListProvider = FutureProvider<List<PeopleData>>((ref) async {
   ref.watch(dataVersionProvider);
@@ -81,6 +82,18 @@ class SettingsScreen extends ConsumerWidget {
                 label: const Text('Add a person'),
               ),
             ],
+          ),
+        ),
+        const Divider(height: 32),
+        Text('About', style: Theme.of(context).textTheme.titleMedium),
+        ListTile(
+          key: const Key('privacyPolicyTile'),
+          contentPadding: EdgeInsets.zero,
+          leading: const Icon(Icons.privacy_tip_outlined),
+          title: const Text('Privacy Policy'),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: () => Navigator.of(context).push(
+            MaterialPageRoute<void>(builder: (_) => const PrivacyPolicyScreen()),
           ),
         ),
       ],
